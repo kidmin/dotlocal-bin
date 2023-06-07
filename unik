@@ -1,0 +1,5 @@
+#!/bin/sh
+
+set -u
+
+exec awk '!h[$0]++ { print $0; }'
