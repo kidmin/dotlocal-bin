@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+
+import os
+import re
+import signal
+import subprocess
+
+
+SUBCOMMAND_ENV = {
+    'LANG': 'C',
+    'PATH': os.getenv('PATH'),
+}
+
+
+IFACE_NAME_LINE_RE = re.compile(r'[0-9]+: ([^:]+): <[^>]+> .+ state (UNKNOWN|NOTPRESENT|DOWN|LOWERLAYERDOWN|TESTING|DORMANT|UP)').match
+
+
+IFACE_TYPES = {
+    'lo':      "\u27b0",
+    'eth':     "\U0001f50c",
+    'en':      "\U0001f50c",
+    'wl':      "\U0001f4f6",
+    'ww':      "\U0001f4f6",
+    'br':      "\U0001f309",
+    'virbr':   "\U0001f309",
+    'xenbr':   "\U0001f309",
+    'docker':  "\U0001f433",
+    'vboxnet': "\U0001f17e\ufe0f ",
+    'vlan':    "\U00002705",
+    'tun':     "\U0001f687",
+    'tap':     "\U0001f6b0",
+}
+def get_iface_type(name):
+    for matcher, iface_type in IFACE_TYPES.items():
+        if name.startswith(matcher):
+            return iface_type
+    return "\u2753"
+
+
+class IpOutputParseError(RuntimeError):
+    def __init__(self, value):
+        self.value = value
+
+    def __str__(self):
+        return repr(self.value)
+
+
+def main():
+    iface_info_list = []
+
+    with subprocess.Popen(
+        ['ip', 'address', 'list'],
+        close_fds=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        env=SUBCOMMAND_ENV,
+    ) as ip_reader:
+        name, status, macaddr, v4addrs, v6addrs = None, None, None, [], []
+        # ip -json is not supported iproute <4.15 (EL7)
+        for line in (l.decode('utf-8').rstrip() for l in ip_reader.stdout):
+            if line[0:4] == '    ':
+                row = line[4:].split(' ')
+                if row[0] == 'link/ether':
+                    macaddr = row[1]
+                elif row[0] == 'inet':
+                    if 'scope' not in row:
+                        raise IpOutputParseError('scope not found')
+                    scope_pos = row.index('scope')
+                    if row[scope_pos+1] in {'global', 'host'}:
+                        v4addrs.append(row[1])
+                elif row[0] == 'inet6':
+                    if 'scope' not in row:
+                        raise IpOutputParseError('scope not found')
+                    scope_pos = row.index('scope')
+                    if row[scope_pos+1] in {'global', 'host'} and 'temporary' not in row:
+                        v6addrs.append(row[1])
+            else:
+                if name is not None:
+                    if name == 'lo':
+                        macaddr = ' '*len('ff:ff:ff:ff:ff:ff')
+                    iface_info_list.append([name, status, macaddr, v4addrs, v6addrs])
+                    name, status, macaddr, v4addrs, v6addrs = None, None, None, [], []
+                m = IFACE_NAME_LINE_RE(line)
+                if not m:
+                    raise IpOutputParseError("failed to parse interface name: {:s}".format(line))
+                name, status = m.groups()
+        iface_info_list.append([name, status, macaddr, v4addrs, v6addrs])
+    if ip_reader.returncode < 0:
+        raise IpOutputParseError("ip(1) was terminated by signal {:s}".format(signal.Signals(-ip_reader.returncode).name))
+    elif ip_reader.returncode > 0:
+        raise IpOutputParseError("ip(1) exited with status {:d}".format(ip_reader.returncode))
+
+    iface_info_list = [e for e in iface_info_list if not e[0].startswith('veth')]
+
+    name_maxlen = max((max((len(e[0]) for e in iface_info_list)), len('ifname'), ))
+    v4addr_maxlen = max((max((len(i) for i in e[3]), default=0) for e in iface_info_list))
+    v6addr_maxlen = max((max((len(i) for i in e[4]), default=0) for e in iface_info_list))
+
+    print('+-' + '-+-'.join([
+        '-'*2,
+        '-'*name_maxlen,
+        '-'*len('LOWERLAYERDOWN'),
+        '-'*len('ff:ff:ff:ff:ff:ff'),
+        '-'*v4addr_maxlen,
+        '-'*v6addr_maxlen,
+        ]) + '-+'
+    )
+    print('| ' + ' | '.join([
+        "\u2753",
+        'ifname' + ' '*(name_maxlen-6),
+        'status' + ' '*8,
+        'macaddr' + ' '*10,
+        'v4addr' + ' '*(v4addr_maxlen-6),
+        'v6addr' + ' '*(v6addr_maxlen-6),
+        ]) + ' |'
+    )
+    print('+=' + '=+='.join([
+        '='*2,
+        '='*name_maxlen,
+        '='*len('LOWERLAYERDOWN'),
+        '='*len('ff:ff:ff:ff:ff:ff'),
+        '='*v4addr_maxlen,
+        '='*v6addr_maxlen,
+        ]) + '=+'
+    )
+    for iface_info in iface_info_list:
+        name = iface_info[0]
+        status = iface_info[1]
+        color_enter = "\x1b[0m"
+        if status in {'UP', 'DORMANT'}:
+            color_enter = "\x1b[1;32m"
+        elif status in {'DOWN', 'LOWERLAYERDOWN', 'NOTPRESENT'}:
+            color_enter = "\x1b[34m"
+        color_leave = "\x1b[0m"
+        macaddr = iface_info[2]
+        v4addr = ''
+        if iface_info[3]:
+            v4addr = iface_info[3][0]
+        v6addr = ''
+        if iface_info[4]:
+            v6addr = iface_info[4][0]
+        print('| ' + ' | '.join([
+            get_iface_type(name),
+            name + ' '*(name_maxlen-len(name)),
+            color_enter + status + color_leave + ' '*(len('LOWERLAYERDOWN')-len(status)),
+            macaddr,
+            v4addr + ' '*(v4addr_maxlen-len(v4addr)),
+            v6addr + ' '*(v6addr_maxlen-len(v6addr)),
+            ]) + ' |'
+        )
+        print('+-' + '-+-'.join([
+            '-'*2,
+            '-'*name_maxlen,
+            '-'*len('LOWERLAYERDOWN'),
+            '-'*len('ff:ff:ff:ff:ff:ff'),
+            '-'*v4addr_maxlen,
+            '-'*v6addr_maxlen,
+            ]) + '-+'
+        )
+
+
+if __name__ == '__main__':
+    main()
+
