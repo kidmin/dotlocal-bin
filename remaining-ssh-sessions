@@ -1,0 +1,5 @@
+#!/bin/sh
+
+set -u
+
+ps x -o pid,start_time,command | grep 's[s]hd..*@' | grep -v ${SSH_TTY#/dev/}'$'
