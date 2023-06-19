@@ -1,0 +1,13 @@
+#!/bin/sh
+
+set -u
+
+if [ "$#" -ne '1' ]; then
+	echo "usage: ntpquery (NTP server)"
+        exit 1
+fi
+
+ntp_server="$1"
+
+exec /usr/sbin/chronyd -d -Q -t 3 "server ${ntp_server} iburst maxsamples 1"
+#exec /usr/sbin/chronyd -d -Q -t 10 "server ${ntp_server} iburst"
