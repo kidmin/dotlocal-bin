@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+
+##
+## ping utility from iputils (has support "-D" for "Print timestamp") is required
+##
+
+import dataclasses
+import datetime
+import io
+import re
+import selectors
+import signal
+import socket
+import subprocess
+import sys
+import time
+from typing import List, Dict, Callable, TypeAlias
+
+
+HISTORY_SIZE: int = 60
+
+
+PING_ENV: Dict[str, str] = {
+    'LANG': 'C',
+}
+
+
+PING_SUCCESS_OUTPUT_MATCHER: Callable = re.compile(r'^\[([0-9]+)\.([0-9]+)\] [0-9]+ bytes from ').match
+
+
+ANSI_MODE_RESET: str = "\x1b[0m"
+ANSI_STYLE_BOLD: str = "\x1b[1m"
+ANSI_COLOR_RED: str = "\x1b[31m"
+ANSI_COLOR_GREEN: str = "\x1b[32m"
+
+
+@dataclasses.dataclass(eq=False)
+class TargetAddress:
+    address: str
+    ping_process: subprocess.Popen | None = None
+    last_success_timestamp: float = -1.0
+    history: List[str] = dataclasses.field(default_factory=list)
+    fail_count: int = -1
+
+
+HostName: TypeAlias = str
+@dataclasses.dataclass(eq=False)
+class PingTargetHost:
+    hostname: HostName
+    ping_v4: TargetAddress | None = None
+    ping_v6: TargetAddress | None = None
+TargetDict: TypeAlias = Dict[HostName, PingTargetHost]
+
+
+HostnameMaxLength: int = -1
+AddressMaxLength: int = -1
+
+
+def handle_sigint(_signum, _frame) -> None:
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    print("[INFO] SIGINT received, terminating...", file=sys.stderr)
+    sys.exit(0)
+
+
+def load_targets() -> TargetDict:
+    global HostnameMaxLength
+    global AddressMaxLength
+
+    targets: TargetDict = dict()
+
+    for hostname in (l.rstrip() for l in sys.stdin):
+        if hostname.lower() in (e.lower() for e in targets.keys()):
+            print(f"[WARN] Duplicate target: {hostname}", file=sys.stderr)
+            continue
+        try:
+            addrinfo = socket.getaddrinfo(
+                hostname,
+                port=None,
+                type=socket.SOCK_DGRAM,
+                flags=socket.AI_ADDRCONFIG
+            )
+        except socket.gaierror:
+            print(f"[WARN] Name resolution failure: {hostname}", file=sys.stderr)
+        else:
+            if len(hostname) > HostnameMaxLength:
+                HostnameMaxLength = len(hostname)
+
+            address_v4 = next((e[4][0] for e in addrinfo if e[0] == socket.AF_INET), None)
+            ping_v4 = None
+            if address_v4:
+                if len(address_v4) > AddressMaxLength:
+                    AddressMaxLength = len(address_v4)
+                ping_v4 = TargetAddress(address_v4)
+
+            address_v6 = next((e[4][0] for e in addrinfo if e[0] == socket.AF_INET6), None)
+            ping_v6 = None
+            if address_v6:
+                if len(address_v6) > AddressMaxLength:
+                    AddressMaxLength = len(address_v6)
+                ping_v6 = TargetAddress(address_v6)
+
+            targets[hostname] = PingTargetHost(hostname=hostname, ping_v4=ping_v4, ping_v6=ping_v6)
+
+    if not targets:
+        print(f"[ERROR] Target list is empty", file=sys.stderr)
+        sys.exit(1)
+
+    return targets
+
+
+def start_ping(targets: TargetDict, sel: selectors.BaseSelector) -> None:
+    for ping_target in (e for target in targets.values() for e in (target.ping_v4, target.ping_v6) if e):
+        ping_target.ping_process = subprocess.Popen(
+            [
+                '/bin/ping',
+                '-n',
+                '-D',
+                '-i', '1',
+                ping_target.address,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            close_fds=True,
+            env=PING_ENV,
+            shell=False,
+            cwd='/tmp',
+            encoding='US-ASCII'
+        )
+
+        ping_target.history = [' ' for _ in range(HISTORY_SIZE)]
+        ping_target.fail_count = 0
+
+        sel.register(ping_target.ping_process.stdout, selectors.EVENT_READ, ping_target) # type: ignore
+
+
+def display(targets: TargetDict, time_now: float) -> None:
+    with io.StringIO() as canvas:
+        canvas.write("\x1b[H\x1b[J") 
+        print("[parallel ping]", file=canvas)
+        print(f"[{datetime.datetime.fromtimestamp(time_now).isoformat(sep=' ', timespec='seconds')} (unix time={int(time_now)})]", file=canvas)
+        print('', file=canvas)
+        for hostname, target in targets.items():
+            for ping_target in (e for e in (target.ping_v4, target.ping_v6) if e):
+                result: str = ' '
+                hostname_decorator: str = ANSI_MODE_RESET
+                if ping_target.last_success_timestamp < time_now - 1.1:
+                    result = ANSI_STYLE_BOLD + ANSI_COLOR_RED + 'x' + ANSI_MODE_RESET
+                    ping_target.fail_count += 1
+                    hostname_decorator = ANSI_STYLE_BOLD
+                else:
+                    result = ANSI_COLOR_GREEN + 'o' + ANSI_MODE_RESET
+
+                ping_target.history.pop(0)
+                ping_target.history.append(result)
+
+                print(
+                    ''.join((
+                        hostname_decorator,
+                        hostname,
+                        ' ' * (HostnameMaxLength - len(hostname) + 2),
+                        f"({ping_target.address})",
+                        ' ' * (AddressMaxLength - len(ping_target.address) + 2),
+                        ANSI_MODE_RESET,
+                        ''.join(ping_target.history),
+                        '  ',
+                        f"losts={ping_target.fail_count:4d}"
+                    )),
+                    file=canvas
+                )
+        print('', file=canvas)
+        print('[press Ctrl-C (send SIGINT) to quit]', file=canvas)
+        sys.stdout.write(canvas.getvalue())
+    sys.stdout.flush()
+
+
+def main() -> None:
+    targets: TargetDict = load_targets()
+    print(f"[INFO] Targets are loaded. Starting...", file=sys.stderr)
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    with selectors.DefaultSelector() as sel:
+        start_ping(targets, sel)
+
+        previous_timestamp: float = time.time()
+        while True:
+            events = sel.select(timeout=0.1)
+            time_now: float = time.time()
+            for event, _ in events:
+                if event.data.ping_process.poll():
+                    event.data.ping_process = None
+                    sel.unregister(event.fileobj)
+                else:
+                    if m := PING_SUCCESS_OUTPUT_MATCHER(event.fileobj.readline()): # type: ignore
+                        timestamp_float: float = float(f"{m.group(1)}.{m.group(2)}")
+                        event.data.last_success_timestamp = timestamp_float
+            if time_now > previous_timestamp + 1.1:
+                if all(e.ping_process is None for target in targets.values() for e in (target.ping_v4, target.ping_v6) if e):
+                    print(f"[ERROR] All ping process has terminated, exiting...", file=sys.stderr)
+                    sys.exit(1)
+
+                display(targets, time_now)
+
+                previous_timestamp = time_now
+
+
+if __name__ == '__main__':
+    main()
+
