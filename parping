@@ -4,8 +4,10 @@
 ## ping utility from iputils (has support "-D" for "Print timestamp") is required
 ##
 
+import curses
 import dataclasses
 import datetime
+import enum
 import io
 import re
 import selectors
@@ -27,10 +29,10 @@ PING_ENV: Dict[str, str] = {
 PING_SUCCESS_OUTPUT_MATCHER: Callable = re.compile(r'^\[([0-9]+)\.([0-9]+)\] [0-9]+ bytes from ').match
 
 
-ANSI_MODE_RESET: str = "\x1b[0m"
-ANSI_STYLE_BOLD: str = "\x1b[1m"
-ANSI_COLOR_RED: str = "\x1b[31m"
-ANSI_COLOR_GREEN: str = "\x1b[32m"
+class ResultColor(enum.IntEnum):
+    UNKNOWN = 1
+    OK = 2
+    FAILED = 3
 
 
 @dataclasses.dataclass(eq=False)
@@ -38,7 +40,7 @@ class TargetAddress:
     address: str
     ping_process: subprocess.Popen | None = None
     last_success_timestamp: float = -1.0
-    history: List[str] = dataclasses.field(default_factory=list)
+    history: List[bool | None] = dataclasses.field(default_factory=list)
     fail_count: int = -1
 
 
@@ -97,7 +99,7 @@ def load_targets() -> TargetDict:
 
                 targets[hostname] = PingTargetHost(hostname=hostname, ping_v4=ping_v4, ping_v6=ping_v6)
     except KeyboardInterrupt:
-        print('cancelled.')
+        print('cancelled.', file=sys.stderr)
         sys.exit(1)
 
     if not targets:
@@ -126,83 +128,97 @@ def start_ping(targets: TargetDict, sel: selectors.BaseSelector) -> None:
             encoding='US-ASCII'
         )
 
-        ping_target.history = [' ' for _ in range(HISTORY_SIZE)]
+        ping_target.history = [None for _ in range(HISTORY_SIZE)]
         ping_target.fail_count = 0
 
         sel.register(ping_target.ping_process.stdout, selectors.EVENT_READ, ping_target) # type: ignore
 
+        time.sleep(0.1)
 
-def display(targets: TargetDict, time_now: float) -> None:
-    with io.StringIO() as canvas:
-        canvas.write("\x1b[H\x1b[J") 
-        print("[parallel ping]", file=canvas)
-        print(f"[{datetime.datetime.fromtimestamp(time_now).isoformat(sep=' ', timespec='seconds')} (unix time={int(time_now)})]", file=canvas)
-        print('', file=canvas)
-        for hostname, target in targets.items():
-            for ping_target in (e for e in (target.ping_v4, target.ping_v6) if e):
-                result: str = ' '
-                hostname_decorator: str = ANSI_MODE_RESET
-                if ping_target.last_success_timestamp < time_now - 1.1:
-                    result = ANSI_STYLE_BOLD + ANSI_COLOR_RED + 'x' + ANSI_MODE_RESET
-                    ping_target.fail_count += 1
-                    hostname_decorator = ANSI_STYLE_BOLD
+
+def display(stdscr: curses.window, targets: TargetDict, time_now: float) -> None:
+    stdscr.clear()
+    stdscr.addstr(0, 0, '[parallel ping]')
+    stdscr.addstr(1, 0, f"[{datetime.datetime.fromtimestamp(time_now).isoformat(sep=' ', timespec='seconds')} (unix time={int(time_now)})]")
+
+    ypos: int = 2
+    for hostname, target in targets.items():
+        for ping_target in (e for e in (target.ping_v4, target.ping_v6) if e):
+            ypos += 1
+
+            ping_target.history.pop(0)
+            if ping_target.last_success_timestamp < time_now - 1.1:
+                ping_target.history.append(False)
+                ping_target.fail_count += 1
+                hostname_style = curses.A_BOLD
+            else:
+                ping_target.history.append(True)
+                hostname_style = curses.A_NORMAL
+
+            stdscr.addstr(ypos, 0, hostname, hostname_style)
+            stdscr.addstr(ypos, HostnameMaxLength + 2, ping_target.address, hostname_style)
+            stdscr.addstr(ypos, HostnameMaxLength + 2 + AddressMaxLength + 2, '|')
+            for result in ping_target.history:
+                if result is None:
+                    stdscr.addstr(' ', curses.A_NORMAL | curses.color_pair(ResultColor.UNKNOWN))
+                elif result:
+                    stdscr.addstr('o', curses.A_NORMAL | curses.color_pair(ResultColor.OK))
                 else:
-                    result = ANSI_COLOR_GREEN + 'o' + ANSI_MODE_RESET
+                    stdscr.addstr('x', curses.A_BOLD | curses.color_pair(ResultColor.FAILED))
+            stdscr.addstr('  ')
+            stdscr.addstr(f"losts={ping_target.fail_count:4d}")
 
-                ping_target.history.pop(0)
-                ping_target.history.append(result)
+    stdscr.addstr(ypos + 2, 0, '[press Ctrl-C (send SIGINT) to quit]')
+    stdscr.refresh()
 
-                print(
-                    ''.join((
-                        hostname_decorator,
-                        hostname,
-                        ' ' * (HostnameMaxLength - len(hostname) + 2),
-                        f"({ping_target.address})",
-                        ' ' * (AddressMaxLength - len(ping_target.address) + 2),
-                        ANSI_MODE_RESET,
-                        '|',
-                        ''.join(ping_target.history),
-                        '  ',
-                        f"losts={ping_target.fail_count:4d}"
-                    )),
-                    file=canvas
-                )
-        print('', file=canvas)
-        print('[press Ctrl-C (send SIGINT) to quit]', file=canvas)
-        sys.stdout.write(canvas.getvalue())
-    sys.stdout.flush()
+
+def display_loop(stdscr: curses.window, sel: selectors.BaseSelector, targets: TargetDict) -> None:
+    needed_lines: int = sum(1 for target in targets.values() for e in (target.ping_v4, target.ping_v6) if e) + 5
+    needed_cols: int = HISTORY_SIZE + HostnameMaxLength + 2 + AddressMaxLength + 2 + 13
+
+    if needed_lines > curses.LINES or needed_cols > curses.COLS:
+        raise RuntimeError(f"not enough terminal size: at least {needed_cols} cols x {needed_lines} lines needed")
+
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    curses.use_default_colors()
+    (default_fg, default_bg) = curses.pair_content(0)
+    curses.init_pair(ResultColor.UNKNOWN, default_fg, default_bg)
+    curses.init_pair(ResultColor.OK, curses.COLOR_GREEN, default_bg)
+    curses.init_pair(ResultColor.FAILED, curses.COLOR_RED, default_bg)
+    try:
+        previous_timestamp: float = time.time()
+        while True:
+            events = sel.select(timeout=0.1)
+            time_now: float = time.time()
+            for event, _ in events:
+                if event.data.ping_process.poll():
+                    event.data.ping_process = None
+                    sel.unregister(event.fileobj)
+                else:
+                    if m := PING_SUCCESS_OUTPUT_MATCHER(event.fileobj.readline()): # type: ignore
+                        timestamp_float: float = float(f"{m.group(1)}.{m.group(2)}")
+                        event.data.last_success_timestamp = timestamp_float
+            if time_now > previous_timestamp + 1.1:
+                if all(e.ping_process is None for target in targets.values() for e in (target.ping_v4, target.ping_v6) if e):
+                    raise RuntimeError('All ping process has terminated')
+
+                display(stdscr, targets, time_now)
+
+                previous_timestamp = time_now
+    except KeyboardInterrupt:
+        print('[INFO] SIGINT received, exiting...', file=sys.stderr)
 
 
 def main() -> None:
     targets: TargetDict = load_targets()
-    print(f"[INFO] Targets are loaded. Starting...", file=sys.stderr)
+    print('[INFO] Targets are loaded. Starting...', file=sys.stderr)
 
     with selectors.DefaultSelector() as sel:
         start_ping(targets, sel)
-
-        try:
-            previous_timestamp: float = time.time()
-            while True:
-                events = sel.select(timeout=0.1)
-                time_now: float = time.time()
-                for event, _ in events:
-                    if event.data.ping_process.poll():
-                        event.data.ping_process = None
-                        sel.unregister(event.fileobj)
-                    else:
-                        if m := PING_SUCCESS_OUTPUT_MATCHER(event.fileobj.readline()): # type: ignore
-                            timestamp_float: float = float(f"{m.group(1)}.{m.group(2)}")
-                            event.data.last_success_timestamp = timestamp_float
-                if time_now > previous_timestamp + 1.1:
-                    if all(e.ping_process is None for target in targets.values() for e in (target.ping_v4, target.ping_v6) if e):
-                        print(f"[ERROR] All ping process has terminated, exiting...", file=sys.stderr)
-                        sys.exit(1)
-
-                    display(targets, time_now)
-
-                    previous_timestamp = time_now
-        except KeyboardInterrupt:
-            print("[INFO] SIGINT received, terminating...", file=sys.stderr)
+        curses.wrapper(display_loop, sel, targets)
 
 
 if __name__ == '__main__':
