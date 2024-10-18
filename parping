@@ -161,6 +161,7 @@ def display(targets: TargetDict, time_now: float) -> None:
                         f"({ping_target.address})",
                         ' ' * (AddressMaxLength - len(ping_target.address) + 2),
                         ANSI_MODE_RESET,
+                        '|',
                         ''.join(ping_target.history),
                         '  ',
                         f"losts={ping_target.fail_count:4d}"
