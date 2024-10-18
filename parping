@@ -8,7 +8,6 @@ import curses
 import dataclasses
 import datetime
 import enum
-import io
 import re
 import selectors
 import socket
