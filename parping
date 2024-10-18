@@ -9,7 +9,6 @@ import datetime
 import io
 import re
 import selectors
-import signal
 import socket
 import subprocess
 import sys
@@ -56,53 +55,53 @@ HostnameMaxLength: int = -1
 AddressMaxLength: int = -1
 
 
-def handle_sigint(_signum, _frame) -> None:
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    print("[INFO] SIGINT received, terminating...", file=sys.stderr)
-    sys.exit(0)
-
-
 def load_targets() -> TargetDict:
     global HostnameMaxLength
     global AddressMaxLength
 
     targets: TargetDict = dict()
 
-    for hostname in (l.rstrip() for l in sys.stdin):
-        if hostname.lower() in (e.lower() for e in targets.keys()):
-            print(f"[WARN] Duplicate target: {hostname}", file=sys.stderr)
-            continue
-        try:
-            addrinfo = socket.getaddrinfo(
-                hostname,
-                port=None,
-                type=socket.SOCK_DGRAM,
-                flags=socket.AI_ADDRCONFIG
-            )
-        except socket.gaierror:
-            print(f"[WARN] Name resolution failure: {hostname}", file=sys.stderr)
-        else:
-            if len(hostname) > HostnameMaxLength:
-                HostnameMaxLength = len(hostname)
+    print('Enter hostname or IPv4/IPv6 address, one per line.')
+    print('End with Ctrl-D:')
+    try:
+        for hostname in (l.rstrip() for l in sys.stdin):
+            if hostname.lower() in (e.lower() for e in targets.keys()):
+                print(f"[WARN] Duplicate target: {hostname}", file=sys.stderr)
+                continue
+            try:
+                addrinfo = socket.getaddrinfo(
+                    hostname,
+                    port=None,
+                    type=socket.SOCK_DGRAM,
+                    flags=socket.AI_ADDRCONFIG
+                )
+            except socket.gaierror:
+                print(f"[WARN] Name resolution failure: {hostname}", file=sys.stderr)
+            else:
+                if len(hostname) > HostnameMaxLength:
+                    HostnameMaxLength = len(hostname)
 
-            address_v4 = next((e[4][0] for e in addrinfo if e[0] == socket.AF_INET), None)
-            ping_v4 = None
-            if address_v4:
-                if len(address_v4) > AddressMaxLength:
-                    AddressMaxLength = len(address_v4)
-                ping_v4 = TargetAddress(address_v4)
+                address_v4 = next((e[4][0] for e in addrinfo if e[0] == socket.AF_INET), None)
+                ping_v4 = None
+                if address_v4:
+                    if len(address_v4) > AddressMaxLength:
+                        AddressMaxLength = len(address_v4)
+                    ping_v4 = TargetAddress(address_v4)
 
-            address_v6 = next((e[4][0] for e in addrinfo if e[0] == socket.AF_INET6), None)
-            ping_v6 = None
-            if address_v6:
-                if len(address_v6) > AddressMaxLength:
-                    AddressMaxLength = len(address_v6)
-                ping_v6 = TargetAddress(address_v6)
+                address_v6 = next((e[4][0] for e in addrinfo if e[0] == socket.AF_INET6), None)
+                ping_v6 = None
+                if address_v6:
+                    if len(address_v6) > AddressMaxLength:
+                        AddressMaxLength = len(address_v6)
+                    ping_v6 = TargetAddress(address_v6)
 
-            targets[hostname] = PingTargetHost(hostname=hostname, ping_v4=ping_v4, ping_v6=ping_v6)
+                targets[hostname] = PingTargetHost(hostname=hostname, ping_v4=ping_v4, ping_v6=ping_v6)
+    except KeyboardInterrupt:
+        print('cancelled.')
+        sys.exit(1)
 
     if not targets:
-        print(f"[ERROR] Target list is empty", file=sys.stderr)
+        print('[ERROR] Target list is empty', file=sys.stderr)
         sys.exit(1)
 
     return targets
@@ -178,31 +177,32 @@ def main() -> None:
     targets: TargetDict = load_targets()
     print(f"[INFO] Targets are loaded. Starting...", file=sys.stderr)
 
-    signal.signal(signal.SIGINT, handle_sigint)
-
     with selectors.DefaultSelector() as sel:
         start_ping(targets, sel)
 
-        previous_timestamp: float = time.time()
-        while True:
-            events = sel.select(timeout=0.1)
-            time_now: float = time.time()
-            for event, _ in events:
-                if event.data.ping_process.poll():
-                    event.data.ping_process = None
-                    sel.unregister(event.fileobj)
-                else:
-                    if m := PING_SUCCESS_OUTPUT_MATCHER(event.fileobj.readline()): # type: ignore
-                        timestamp_float: float = float(f"{m.group(1)}.{m.group(2)}")
-                        event.data.last_success_timestamp = timestamp_float
-            if time_now > previous_timestamp + 1.1:
-                if all(e.ping_process is None for target in targets.values() for e in (target.ping_v4, target.ping_v6) if e):
-                    print(f"[ERROR] All ping process has terminated, exiting...", file=sys.stderr)
-                    sys.exit(1)
+        try:
+            previous_timestamp: float = time.time()
+            while True:
+                events = sel.select(timeout=0.1)
+                time_now: float = time.time()
+                for event, _ in events:
+                    if event.data.ping_process.poll():
+                        event.data.ping_process = None
+                        sel.unregister(event.fileobj)
+                    else:
+                        if m := PING_SUCCESS_OUTPUT_MATCHER(event.fileobj.readline()): # type: ignore
+                            timestamp_float: float = float(f"{m.group(1)}.{m.group(2)}")
+                            event.data.last_success_timestamp = timestamp_float
+                if time_now > previous_timestamp + 1.1:
+                    if all(e.ping_process is None for target in targets.values() for e in (target.ping_v4, target.ping_v6) if e):
+                        print(f"[ERROR] All ping process has terminated, exiting...", file=sys.stderr)
+                        sys.exit(1)
 
-                display(targets, time_now)
+                    display(targets, time_now)
 
-                previous_timestamp = time_now
+                    previous_timestamp = time_now
+        except KeyboardInterrupt:
+            print("[INFO] SIGINT received, terminating...", file=sys.stderr)
 
 
 if __name__ == '__main__':
