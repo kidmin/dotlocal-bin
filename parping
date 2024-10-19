@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
 ##
-## ping utility from iputils (has support "-D" for "Print timestamp") is required
+## parping: parallel ping to multiple targets in IPv4/IPv6
 ##
 
 import curses
 import dataclasses
 import datetime
 import enum
+import pathlib
 import re
 import selectors
 import socket
@@ -25,13 +26,14 @@ PING_ENV: Dict[str, str] = {
 }
 
 
-PING_SUCCESS_OUTPUT_MATCHER: Callable = re.compile(r'^\[([0-9]+)\.([0-9]+)\] [0-9]+ bytes from ').match
+PING_SUCCESS_OUTPUT_MATCHER: Callable = re.compile(r'^[0-9]+ bytes from ').match
 
 
 class ResultColor(enum.IntEnum):
     UNKNOWN = 1
     OK = 2
     FAILED = 3
+    PARPING_ERROR = 4
 
 
 @dataclasses.dataclass(eq=False)
@@ -50,6 +52,10 @@ class PingTargetHost:
     ping_v4: TargetAddress | None = None
     ping_v6: TargetAddress | None = None
 TargetDict: TypeAlias = Dict[HostName, PingTargetHost]
+
+
+Ping4Path: str
+Ping6Path: str
 
 
 HostnameMaxLength: int = -1
@@ -108,13 +114,41 @@ def load_targets() -> TargetDict:
     return targets
 
 
+def detect_ping_path() -> None:
+    global Ping4Path
+    global Ping6Path
+
+    SEARCH_PATHS: List[pathlib.Path] = [pathlib.Path('/bin'), pathlib.Path('/sbin')]
+
+    for path in SEARCH_PATHS:
+        ping_path: pathlib.Path = path / 'ping'
+        if not ping_path.is_file():
+            continue
+        ping6_path: pathlib.Path = path / 'ping6'
+        if ping6_path.is_file():
+            Ping4Path = str(ping_path)
+            Ping6Path = str(ping6_path)
+            return
+        else:
+            Ping4Path = str(ping_path)
+            Ping6Path = str(ping_path)
+            return
+
+    raise RuntimeError(f"failed to find ping command from {SEARCH_PATHS}")
+
+
 def start_ping(targets: TargetDict, sel: selectors.BaseSelector) -> None:
-    for ping_target in (e for target in targets.values() for e in (target.ping_v4, target.ping_v6) if e):
+    for ping_target in (e for t in targets.values() for e in (t.ping_v4, t.ping_v6) if e):
+        ping_path: str
+        if ':' in ping_target.address:
+            ping_path = Ping6Path
+        else:
+            ping_path = Ping4Path
+
         ping_target.ping_process = subprocess.Popen(
             [
-                '/bin/ping',
+                ping_path,
                 '-n',
-                '-D',
                 '-i', '1',
                 ping_target.address,
             ],
@@ -155,24 +189,29 @@ def display(stdscr: curses.window, targets: TargetDict, time_now: float) -> None
                 hostname_style = curses.A_NORMAL
 
             stdscr.addstr(ypos, 0, hostname, hostname_style)
-            stdscr.addstr(ypos, HostnameMaxLength + 2, ping_target.address, hostname_style)
-            stdscr.addstr(ypos, HostnameMaxLength + 2 + AddressMaxLength + 2, '|')
+            stdscr.addstr(ypos, HostnameMaxLength + 1, f"({ping_target.address})", hostname_style)
+            stdscr.addstr(ypos, HostnameMaxLength + 1 + AddressMaxLength + 3, '|')
             for result in ping_target.history:
                 if result is None:
                     stdscr.addstr(' ', curses.A_NORMAL | curses.color_pair(ResultColor.UNKNOWN))
+                elif ping_target.ping_process is None:
+                    stdscr.addstr('_', curses.A_BOLD | curses.color_pair(ResultColor.PARPING_ERROR))
                 elif result:
                     stdscr.addstr('o', curses.A_NORMAL | curses.color_pair(ResultColor.OK))
                 else:
                     stdscr.addstr('x', curses.A_BOLD | curses.color_pair(ResultColor.FAILED))
             stdscr.addstr('  ')
-            stdscr.addstr(f"losts={ping_target.fail_count:4d}")
+            if ping_target.ping_process is not None:
+                stdscr.addstr(f"losts={ping_target.fail_count:4d}")
+            else:
+                stdscr.addstr('*ping died')
 
     stdscr.addstr(ypos + 2, 0, '[press Ctrl-C (send SIGINT) to quit]')
     stdscr.refresh()
 
 
 def display_loop(stdscr: curses.window, sel: selectors.BaseSelector, targets: TargetDict) -> None:
-    needed_lines: int = sum(1 for target in targets.values() for e in (target.ping_v4, target.ping_v6) if e) + 5
+    needed_lines: int = sum(1 for t in targets.values() for e in (t.ping_v4, t.ping_v6) if e) + 5
     needed_cols: int = HISTORY_SIZE + HostnameMaxLength + 2 + AddressMaxLength + 2 + 13
 
     if needed_lines > curses.LINES or needed_cols > curses.COLS:
@@ -187,6 +226,7 @@ def display_loop(stdscr: curses.window, sel: selectors.BaseSelector, targets: Ta
     curses.init_pair(ResultColor.UNKNOWN, default_fg, default_bg)
     curses.init_pair(ResultColor.OK, curses.COLOR_GREEN, default_bg)
     curses.init_pair(ResultColor.FAILED, curses.COLOR_RED, default_bg)
+    curses.init_pair(ResultColor.PARPING_ERROR, curses.COLOR_BLUE, default_bg)
     try:
         previous_timestamp: float = time.time()
         while True:
@@ -198,10 +238,10 @@ def display_loop(stdscr: curses.window, sel: selectors.BaseSelector, targets: Ta
                     sel.unregister(event.fileobj)
                 else:
                     if m := PING_SUCCESS_OUTPUT_MATCHER(event.fileobj.readline()): # type: ignore
-                        timestamp_float: float = float(f"{m.group(1)}.{m.group(2)}")
+                        timestamp_float: float = time_now
                         event.data.last_success_timestamp = timestamp_float
             if time_now > previous_timestamp + 1.1:
-                if all(e.ping_process is None for target in targets.values() for e in (target.ping_v4, target.ping_v6) if e):
+                if all(e.ping_process is None for t in targets.values() for e in (t.ping_v4, t.ping_v6) if e):
                     raise RuntimeError('All ping process has terminated')
 
                 display(stdscr, targets, time_now)
@@ -212,6 +252,8 @@ def display_loop(stdscr: curses.window, sel: selectors.BaseSelector, targets: Ta
 
 
 def main() -> None:
+    detect_ping_path()
+
     targets: TargetDict = load_targets()
     print('[INFO] Targets are loaded. Starting...', file=sys.stderr)
 
