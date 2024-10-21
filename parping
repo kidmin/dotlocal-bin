@@ -29,6 +29,9 @@ PING_ENV: Dict[str, str] = {
 PING_SUCCESS_OUTPUT_MATCHER: Callable = re.compile(r'^[0-9]+ bytes from ').match
 
 
+INPUT_MATCHER: Callable = re.compile(r'^(?:[0-9a-zA-Z](?:[0-9a-zA-Z-]*[0-9a-zA-Z])?\.)*[0-9a-zA-Z](?:[0-9a-zA-Z-]*[0-9a-zA-Z])?\.?$|^[0-9a-fA-F:]+$').match
+
+
 class ResultColor(enum.IntEnum):
     UNKNOWN = 1
     OK = 2
@@ -72,6 +75,12 @@ def load_targets() -> TargetDict:
     print('End with Ctrl-D:')
     try:
         for hostname in (l.rstrip() for l in sys.stdin):
+            address_v4: str | None
+            address_v6: str | None
+
+            if INPUT_MATCHER(hostname) is None:
+                print(f"[WARN] invalid hostname or IP address: {hostname}", file=sys.stderr)
+                continue
             if hostname.lower() in (e.lower() for e in targets.keys()):
                 print(f"[WARN] Duplicate target: {hostname}", file=sys.stderr)
                 continue
@@ -168,6 +177,10 @@ def start_ping(targets: TargetDict, sel: selectors.BaseSelector) -> None:
 
         time.sleep(0.1)
 
+        print('.', end='', file=sys.stderr)
+        sys.stderr.flush()
+    print('', file=sys.stderr)
+
 
 def display(stdscr: curses.window, targets: TargetDict, time_now: float) -> None:
     stdscr.clear()
@@ -255,7 +268,8 @@ def main() -> None:
     detect_ping_path()
 
     targets: TargetDict = load_targets()
-    print('[INFO] Targets are loaded. Starting...', file=sys.stderr)
+    print('[INFO] Targets are loaded. Starting', end='', file=sys.stderr)
+    sys.stderr.flush()
 
     with selectors.DefaultSelector() as sel:
         start_ping(targets, sel)
