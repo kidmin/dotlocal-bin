@@ -60,6 +60,10 @@ class PingTargetHost:
 TargetDict: TypeAlias = Dict[HostName, PingTargetHost]
 
 
+class ParpingRuntimeError(RuntimeError):
+    pass
+
+
 Ping4Path: str
 Ping6Path: str
 
@@ -228,7 +232,7 @@ def display_loop(stdscr: curses.window, sel: selectors.BaseSelector, targets: Ta
     needed_cols: int = HISTORY_SIZE + HostnameMaxLength + 2 + AddressMaxLength + 2 + 13
 
     if needed_lines > curses.LINES or needed_cols > curses.COLS:
-        raise RuntimeError(f"not enough terminal size: at least {needed_cols} cols x {needed_lines} lines needed")
+        raise ParpingRuntimeError(f"not enough terminal size: at least {needed_cols} cols x {needed_lines} lines needed")
 
     try:
         curses.curs_set(0)
@@ -240,28 +244,26 @@ def display_loop(stdscr: curses.window, sel: selectors.BaseSelector, targets: Ta
     curses.init_pair(ResultColor.OK, curses.COLOR_GREEN, default_bg)
     curses.init_pair(ResultColor.FAILED, curses.COLOR_RED, default_bg)
     curses.init_pair(ResultColor.PARPING_ERROR, curses.COLOR_BLUE, default_bg)
-    try:
-        previous_timestamp: float = time.time()
-        while True:
-            events = sel.select(timeout=0.1)
-            time_now: float = time.time()
-            for event, _ in events:
-                if event.data.ping_process.poll():
-                    event.data.ping_process = None
-                    sel.unregister(event.fileobj)
-                else:
-                    if m := PING_SUCCESS_OUTPUT_MATCHER(event.fileobj.readline()): # type: ignore
-                        timestamp_float: float = time_now
-                        event.data.last_success_timestamp = timestamp_float
-            if time_now > previous_timestamp + 1.1:
-                if all(e.ping_process is None for t in targets.values() for e in (t.ping_v4, t.ping_v6) if e):
-                    raise RuntimeError('All ping process has terminated')
 
-                display(stdscr, targets, time_now)
+    previous_timestamp: float = time.time()
+    while True:
+        events = sel.select(timeout=0.1)
+        time_now: float = time.time()
+        for event, _ in events:
+            if event.data.ping_process.poll():
+                event.data.ping_process = None
+                sel.unregister(event.fileobj)
+            else:
+                if m := PING_SUCCESS_OUTPUT_MATCHER(event.fileobj.readline()): # type: ignore
+                    timestamp_float: float = time_now
+                    event.data.last_success_timestamp = timestamp_float
+        if time_now > previous_timestamp + 1.1:
+            if all(e.ping_process is None for t in targets.values() for e in (t.ping_v4, t.ping_v6) if e):
+                raise ParpingRuntimeError('All ping process has terminated')
 
-                previous_timestamp = time_now
-    except KeyboardInterrupt:
-        print('[INFO] SIGINT received, exiting...', file=sys.stderr)
+            display(stdscr, targets, time_now)
+
+            previous_timestamp = time_now
 
 
 def main() -> None:
@@ -271,9 +273,15 @@ def main() -> None:
     print('[INFO] Targets are loaded. Starting', end='', file=sys.stderr)
     sys.stderr.flush()
 
-    with selectors.DefaultSelector() as sel:
-        start_ping(targets, sel)
-        curses.wrapper(display_loop, sel, targets)
+    try:
+        with selectors.DefaultSelector() as sel:
+            start_ping(targets, sel)
+            curses.wrapper(display_loop, sel, targets)
+    except KeyboardInterrupt:
+        print('[INFO] SIGINT received, exiting...', file=sys.stderr)
+    except ParpingRuntimeError as e:
+        print(f"[ERROR] {e.args[0]}, exiting...", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == '__main__':
