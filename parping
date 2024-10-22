@@ -111,7 +111,7 @@ def load_targets() -> TargetDict:
                         AddressMaxLength = len(address_v4)
                     ping_v4 = TargetAddress(address_v4)
 
-                address_v6 = next((e[4][0] for e in addrinfo if e[0] == socket.AF_INET6), None)
+                address_v6 = next((e[4][0] for e in addrinfo if e[0] == socket.AF_INET6 and not e[4][0].startswith('fe80::')), None)
                 ping_v6 = None
                 if address_v6:
                     if len(address_v6) > AddressMaxLength:
