@@ -72,6 +72,9 @@ HostnameMaxLength: int = -1
 AddressMaxLength: int = -1
 
 
+BATON: List[str] = ['|', '/', '-', '\\']
+
+
 def load_targets() -> TargetDict:
     global HostnameMaxLength
     global AddressMaxLength
@@ -188,7 +191,7 @@ def start_ping(targets: TargetDict, sel: selectors.BaseSelector) -> None:
 
 def display(stdscr: curses.window, targets: TargetDict, time_now: float) -> None:
     stdscr.clear()
-    stdscr.addstr(0, 0, '[parallel ping]')
+    stdscr.addstr(0, 0, '[parallel ping]' + '  ' + BATON[int(time_now)%len(BATON)])
     stdscr.addstr(1, 0, f"[{datetime.datetime.fromtimestamp(time_now).isoformat(sep=' ', timespec='seconds')} (unix time={int(time_now)})]")
 
     ypos: int = 2
