@@ -1,13 +1,103 @@
-#!/bin/sh
+#!/usr/bin/env python3
 
-set -u
+##
+## ntpquery
+##
 
-if [ "$#" -ne '1' ]; then
-	echo "usage: ntpquery (NTP server)"
-        exit 1
-fi
+import datetime
+import random
+import socket
+import sys
 
-ntp_server="$1"
 
-exec /usr/sbin/chronyd -d -Q -t 3 "server ${ntp_server} iburst maxsamples 1"
-#exec /usr/sbin/chronyd -d -Q -t 10 "server ${ntp_server} iburst"
+NTP_SERVER_PORT = 123
+
+
+NTP_QUERY_TIMEOUT = 3.0
+
+
+GAI_FLAGS = socket.AI_ADDRCONFIG | socket.AI_NUMERICHOST | socket.AI_NUMERICSERV
+
+
+class NTPResponseMessageError(RuntimeError):
+    pass
+
+
+def usage():
+    print('usage: ntpquery (ipv4_address|ipv6_address)')
+    sys.exit(1)
+
+
+def main():
+    if len(sys.argv) < 2:
+        usage()
+
+    ntp_query = [
+        0b11100011,             # LI (0b11: clock unsynchronized), VN (0b100: v4), Mode (0b011: client)
+        0x00,                   # stratum
+        0x00,                   # max. poll interval (2^0 = 1 second)
+        0x00,                   # time precision
+        0x00, 0x00, 0x00, 0x00, # root delay
+        0x00, 0x00, 0x00, 0x00, # root dispersion
+        0x00, 0x00, 0x00, 0x00, # reference id
+        0x00, 0x00, 0x00, 0x00, # reference time (integral)
+        0x00, 0x00, 0x00, 0x00, # reference time (fractional)
+        0x00, 0x00, 0x00, 0x00, # originate time (integral)
+        0x00, 0x00, 0x00, 0x00, # originate time (fractional)
+        0x00, 0x00, 0x00, 0x00, # receive time (integral)
+        0x00, 0x00, 0x00, 0x00, # receive time (fractional)
+        0x00, 0x00, 0x00, 0x00, # transmit time (integral)
+        0x00, 0x00, 0x00, 0x00, # transmit time (fractional)
+    ]
+    ntp_query[40:48] = random.randrange(0, 2**64).to_bytes(length=8, byteorder='big', signed=False)
+
+    ntp_query = bytes(ntp_query)
+
+    try:
+        ntp_server_addrinfo = socket.getaddrinfo(sys.argv[1], NTP_SERVER_PORT, proto=socket.IPPROTO_UDP, flags=GAI_FLAGS)
+    except socket.gaierror:
+        ntp_server_addrinfo = []
+    if len(ntp_server_addrinfo) < 1:
+        print('invalid IP address')
+        sys.exit(1)
+    (addr_family, socket_type, _, _, ntp_server_addr) = ntp_server_addrinfo[0]
+
+    with socket.socket(addr_family, socket_type) as ntp_server_sock:
+        ntp_server_sock.connect(ntp_server_addr)
+        ntp_server_sock.settimeout(NTP_QUERY_TIMEOUT)
+
+        ntp_server_sock.send(ntp_query)
+        ts_query_sent = datetime.datetime.now().timestamp()
+
+        ntp_response = ntp_server_sock.recv(48)
+        ts_response_received = datetime.datetime.now().timestamp()
+
+        if len(ntp_response) != 48:
+            raise NTPResponseMessageError(f"unexpected length: {len(ntp_response)}")
+        if (ntp_response[0] & 0b00111000) != 0b00100000:
+            raise NTPResponseMessageError(f"version mismatch: {ntp_response[0] >> 3 & 0b111}")
+        if (ntp_response[0] & 0b00000111) != 0b00000100:
+            raise NTPResponseMessageError(f"mode != server (4): {ntp_response[0] & 0b111}")
+        if ntp_response[24:32] != ntp_query[40:48]:
+            raise NTPResponseMessageError('response originate time does not match to query transmit time')
+
+        query_server_receive_time_integral = int.from_bytes(ntp_response[32:36], byteorder='big', signed=False)
+        query_server_receive_time_fractional = int.from_bytes(ntp_response[36:40], byteorder='big', signed=False)
+        ts_query_server_receive = \
+            query_server_receive_time_integral - 2208988800 + query_server_receive_time_fractional / float(2**32)
+
+        response_transmit_time_integral = int.from_bytes(ntp_response[40:44], byteorder='big', signed=False)
+        response_transmit_time_fractional = int.from_bytes(ntp_response[44:48], byteorder='big', signed=False)
+        ts_response_transmit = \
+            response_transmit_time_integral - 2208988800 + response_transmit_time_fractional / float(2**32)
+
+        response_transmit_time = datetime.datetime.fromtimestamp(ts_response_transmit)
+        print(f"server timestamp: {response_transmit_time.isoformat(timespec='microseconds')}")
+        print(f"rtt: {((ts_response_received - ts_query_sent) - (ts_response_transmit - ts_query_server_receive)) * 1000.0:.03f} milliseconds")
+
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()
+
