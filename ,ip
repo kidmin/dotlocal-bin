@@ -2,7 +2,6 @@
 
 import os
 import re
-import signal
 import subprocess
 
 
@@ -92,10 +91,8 @@ def main():
                     raise IpOutputParseError("failed to parse interface name: {:s}".format(line))
                 name, status = m.groups()
         iface_info_list.append([name, status, macaddr, v4addrs, v6addrs])
-    if ip_reader.returncode < 0:
-        raise IpOutputParseError("ip(1) was terminated by signal {:s}".format(signal.Signals(-ip_reader.returncode).name))
-    elif ip_reader.returncode > 0:
-        raise IpOutputParseError("ip(1) exited with status {:d}".format(ip_reader.returncode))
+    if ip_reader.returncode != 0:
+        raise subprocess.CalledProcessError(returncode=ip_reader.returncode, cmd=ip_reader.args)
 
     iface_info_list = [e for e in iface_info_list if not e[0].startswith('veth')]
 
