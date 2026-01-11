@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+
+##
+## uctail: uniq -c + tail
+##
+
+import argparse
+import os
+import select
+import signal
+import sys
+import time
+
+
+REDRAW_INTERVAL_SECS = 0.5
+
+
+TAIL_NLINES_DEFAULT = 10
+
+
+def positive_int(arg):
+    arg_int = int(arg)
+    if arg_int <= 0:
+        raise ValueError()
+    return arg_int
+
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='uctail')
+    parser.add_argument('-n', '--lines', type=positive_int, default=TAIL_NLINES_DEFAULT)
+    args = parser.parse_args()
+
+    remainder = ''
+    eof = False
+    summary = dict()
+    prev_summary = dict()
+    top_line_content = None
+    os.set_blocking(sys.stdin.fileno(), False)
+    last_redraw = -1
+    while True:
+        stdin_ready, _, _ = select.select([sys.stdin], [], [], REDRAW_INTERVAL_SECS)
+        if stdin_ready:
+            ibuf = sys.stdin.read()
+            if len(ibuf) == 0:
+                eof = True
+            try:
+                stdin_input, remainder = (remainder + ibuf).rsplit('\n', maxsplit=1)
+            except ValueError:
+                pass
+            else:
+                for line in stdin_input.splitlines():
+                    if not top_line_content:
+                        top_line_content = line.encode('UTF-8')
+                    if len(summary) > args.lines and top_line_content > line.encode('UTF-8'):
+                        continue
+                    if not line in summary:
+                        summary[line] = 0
+                        if len(summary) > args.lines:
+                            del summary[sorted(summary)[0]]
+                            top_line_content = sorted(summary)[0].encode('UTF-8')
+                        else:
+                            if len(summary) > 1:
+                                sys.stdout.write("\n")
+                    if line in summary:
+                        summary[line] += 1
+        if time.time() - last_redraw > REDRAW_INTERVAL_SECS or eof:
+            redrawn = False
+            bottom_line_ncolumns = None
+            new_summary = dict()
+            for nth, key in enumerate(reversed(sorted(summary.keys()))):
+                if not bottom_line_ncolumns:
+                    bottom_line_ncolumns = len(f"{summary[key]:8n}  {key}")
+                if f"{nth}#{key}" not in prev_summary or prev_summary[f"{nth}#{key}"] != summary[key]:
+                    sys.stdout.write(f"\x1b[0G\x1b[2K")
+                    sys.stdout.write(f"{summary[key]:8n}  {key}")
+                    sys.stdout.write("\x1b[1F")
+                    redrawn = True
+                new_summary[f"{nth}#{key}"] = summary[key]
+            if redrawn:
+                sys.stdout.write(f"\x1b[{len(summary)}E\x1b[{bottom_line_ncolumns}C")
+                sys.stdout.flush()
+            prev_summary = new_summary
+            last_redraw = time.time()
+        if eof:
+            break
+    return
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('')
+        sys.exit(128 + signal.SIGINT)
+    else:
+        print('')
+        sys.exit(0)
+
